@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	chclient "github.com/jpillora/chisel/client"
-	chserver "github.com/jpillora/chisel/server"
-	chshare "github.com/jpillora/chisel/share"
-	"github.com/jpillora/chisel/share/cos"
+	chclient "github.com/codaul/volume/client"
+	chserver "github.com/codaul/volume/server"
+	chshare "github.com/codaul/volume/share"
+	"github.com/codaul/volume/share/cos"
 )
 
 var help = `
@@ -28,7 +28,7 @@ var help = `
     client - runs chisel in client mode
 
   Read more:
-    https://github.com/jpillora/chisel
+    https://github.com/codaul/volume
 
 `
 
@@ -81,7 +81,7 @@ var commonHelp = `
     ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
 
   Read more:
-    https://github.com/jpillora/chisel
+    https://github.com/codaul/volume
 
 `
 
