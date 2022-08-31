@@ -79,7 +79,7 @@ func (s *Server) tlsLetsEncrypt(domains []string) *tls.Config {
 				h = u.HomeDir
 			}
 		}
-		c = filepath.Join(h, ".cache", "chisel")
+		c = filepath.Join(h, ".cache", "volume")
 	}
 	if c != "-" {
 		s.Infof("LetsEncrypt cache directory %s", c)

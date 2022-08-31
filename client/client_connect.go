@@ -65,7 +65,7 @@ func (c *Client) connectionLoop(ctx context.Context) error {
 	return nil
 }
 
-//connectionOnce connects to the chisel server and blocks
+//connectionOnce connects to the volume server and blocks
 func (c *Client) connectionOnce(ctx context.Context) (connected, retry bool, err error) {
 	//already closed?
 	select {
@@ -117,7 +117,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected, retry bool, err
 		return false, retry, err
 	}
 	defer sshConn.Close()
-	// chisel client handshake (reverse of server handshake)
+	// volume client handshake (reverse of server handshake)
 	// send configuration
 	c.Debugf("Sending config")
 	t0 := time.Now()

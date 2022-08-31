@@ -20,7 +20,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Config is the configuration for the chisel service
+// Config is the configuration for the volume service
 type Config struct {
 	KeySeed   string
 	AuthFile  string
@@ -32,7 +32,7 @@ type Config struct {
 	TLS       TLSConfig
 }
 
-// Server respresent a chisel service
+// Server respresent a volume service
 type Server struct {
 	*cio.Logger
 	config       *Config
@@ -51,7 +51,7 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: settings.EnvInt("WS_BUFF_SIZE", 0),
 }
 
-// NewServer creates and returns a new chisel server
+// NewServer creates and returns a new volume server
 func NewServer(c *Config) (*Server, error) {
 	server := &Server{
 		config:     c,
@@ -116,7 +116,7 @@ func NewServer(c *Config) (*Server, error) {
 	return server, nil
 }
 
-// Run is responsible for starting the chisel service.
+// Run is responsible for starting the volume service.
 // Internally this calls Start then Wait.
 func (s *Server) Run(host, port string) error {
 	if err := s.Start(host, port); err != nil {

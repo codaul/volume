@@ -242,7 +242,7 @@ func (c *Client) Start(ctx context.Context) error {
 		via = " via " + c.proxyURL.String()
 	}
 	c.Infof("Connecting to %s%s\n", c.server, via)
-	//connect to chisel server
+	//connect to volume server
 	eg.Go(func() error {
 		return c.connectionLoop(ctx)
 	})

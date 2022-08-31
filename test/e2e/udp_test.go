@@ -19,7 +19,7 @@ func TestUDP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	//chisel client+server
+	//volume client+server
 	inboundPort := availableUDPPort()
 	teardown := simpleSetup(t,
 		&chserver.Config{},

